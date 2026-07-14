@@ -1,0 +1,4 @@
+# Python 3.9+
+# The puller (turn_export_anon.py) and sampler use only the standard library.
+# openpyxl is needed by the report builders (build_*.py, wow_read_change.py).
+openpyxl>=3.1

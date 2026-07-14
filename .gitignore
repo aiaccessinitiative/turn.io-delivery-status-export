@@ -1,0 +1,19 @@
+# secrets — never commit
+.env
+
+# data, outputs, and resumable-pull working dirs (PII / large / regenerated)
+data/*
+!data/.gitkeep
+*.csv
+
+# reference files are program data, not code (see reference/README.md)
+reference/*.xlsx
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# os cruft
+.DS_Store
+Thumbs.db
