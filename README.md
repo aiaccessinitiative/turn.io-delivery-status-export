@@ -19,6 +19,8 @@ turn_export_anon.py          the puller — pulls a campaign's messages -> anony
 fix_arms_and_verify.py       recompute arm column + verify per-variant counts vs the forecast
 build_geo_xlsx.py            8-tab delivery report by district / mandal / cluster
 build_status_geo_file.py     ppbno + status + last_status_timestamp + geography (shareable CSV)
+build_week_matrix.py         merge N weekly pulls into ONE wide row per farmer (post-processing, not a puller)
+test_week_matrix.py          offline smoke test for build_week_matrix.py (fake pulls + fake roster)
 build_advisory_report.py     fill the dept's per-variant advisory template (with forecast text)
 wow_read_change.py           week-over-week read-rate change by geography
 sample_farmers_per_mandal.py random N-farmers-per-mandal sample (district, mandal, ppbno)
@@ -114,6 +116,22 @@ python build_advisory_report.py
 ```
 **Edit per run:** the `WEEKS` list (tab name, forecast week label, that week's pull CSV). Needs `reference/advisory_report_template.xlsx` and `reference/forecast_inputs.xlsx`.
 
+### `build_week_matrix.py`
+Merges N weekly pulls into a single wide CSV, one row per farmer, with a block of columns per week: `{w}_variant, {w}_arm, {w}_status, {w}_read, {w}_status_ts`. Weeks a farmer was not pulled in show `not_in_pull`. A farmer with two messages in one week collapses to the furthest status reached. Runs through a temporary SQLite file, so ~1.4M farmers is fine.
+
+This is post-processing on files `turn_export_anon.py` already wrote. It is not a second pull method and never calls the API.
+```bash
+python build_week_matrix.py     --week w1=data/farmers_delivery_status_anon_<w1>.csv     --week w2=data/farmers_delivery_status_anon_<w2>.csv     --week w3=data/farmers_delivery_status_anon_<w3>.csv     --week w4=data/farmers_delivery_status_anon_<w4>.csv     --geo
+```
+By default it writes a 200-row `*.preview.csv`, prints the per-week status mix and variant counts, and stops. Check the preview, then re-run with `--approved` to write the full file. Other flags: `--all-roster` (every roster ppbno gets a row, even if never messaged), `--limit-rows N`, `--keep-db`.
+
+**`--with-phone`** joins `MobileNo` from the roster in as a `phone` column. This is the one place in the toolkit that writes a phone number to disk. It exists for an operator who already holds the roster and needs the number beside the status. Treat the output as PII: keep it out of the repo and shared drives, and delete it when the job is done.
+
+Run `fix_arms_and_verify.py` on each weekly pull first; the `arm` column straight out of the puller is not authoritative.
+```bash
+python test_week_matrix.py     # offline smoke test, no token or roster needed
+```
+
 ### `wow_read_change.py`
 Week-over-week read-rate (`read / (read + delivered)`) change by district / mandal / cluster, with a summary tab. Compare pulls at **matched maturity** (equal days-after-send) for the numbers to be valid.
 ```bash
@@ -133,7 +151,8 @@ python sample_farmers_per_mandal.py 100        # 100 per mandal, seed 42
 2. **Pull the campaign:** `python turn_export_anon.py --from <day before send> --until <day after send> --auto-band`. Bound with `--until` to the single send day.
 3. **Verify:** update `arm_for`/`vnum`/`EXPECTED` in `fix_arms_and_verify.py`, then run it. Expect the pulled total to be ~0.1-0.2% under the forecast (opt-outs), spread proportionally across variants.
 4. **Report:** run `build_geo_xlsx.py` (geographic delivery) and, if the dept wants it, `build_advisory_report.py`.
-5. **Optional trend:** once two or more weeks are pulled at matched maturity, run `wow_read_change.py`.
+5. **Merge weeks:** once several weeks are pulled, `build_week_matrix.py` gives one wide row per farmer across all of them (add `--with-phone` only if the operator needs numbers on disk).
+6. **Optional trend:** once two or more weeks are pulled at matched maturity, run `wow_read_change.py`.
 
 ## Key concepts and gotchas
 
