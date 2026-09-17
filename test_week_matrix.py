@@ -78,6 +78,26 @@ def write_fixtures(root: Path):
                     "last_status_timestamp": "2026-06-12T09:00:00.000Z",
                 })
 
+    # Phone-keyed pulls, as written by turn_export_anon.py --phone-key: same
+    # rows, but the key column is `phone` holding the recipient number.
+    phone_of = {p: "9190000000%02d" % i for i, p in enumerate(GEO)}
+    for w_index, week in enumerate(WEEKS):
+        path = data / ("pullphone_%s.csv" % week)
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["phone"] + PULL_COLS[1:])
+            writer.writeheader()
+            for ppbno, per_week in PLAN.items():
+                if week not in per_week:
+                    continue
+                variant, arm_label, status = per_week[week]
+                ts = "2026-06-%02dT09:00:00.000Z" % (5 + w_index * 7)
+                writer.writerow({
+                    "phone": phone_of[ppbno], "variant": variant,
+                    "arm": arm_label[-1], "arm_label": arm_label,
+                    "last_status": status, "timestamp": ts,
+                    "last_status_timestamp": ts,
+                })
+
     roster = root / "roster.csv"
     with roster.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -172,12 +192,48 @@ def main():
         check("with-phone exit code", proc.returncode, 0)
         check("with-phone warns on stdout",
               "will contain phone numbers" in (proc.stdout or ""), True)
+
+        # Default output name must say what the file contains.
+        proc = run(base + ["--with-phone", "--approved"], env,
+                   "with-phone run, default --out")
+        check("default phone output exit code", proc.returncode, 0)
+        check("default phone output is named *_with_phone.csv",
+              (data / "farmer_week_matrix_with_phone.csv").exists(), True)
+        proc = run(base + ["--approved"], env, "anon run, default --out")
+        check("default anon output is farmer_week_matrix.csv",
+              (data / "farmer_week_matrix.csv").exists(), True)
         phone_rows = read_rows(out_phone)
         check("phone column present", "phone" in phone_rows["PB001"], True)
         check("phone joined from roster (PB002 is roster row 1)",
               phone_rows["PB002"].get("phone"), "919000000001")
         check("phone run has no geo columns without --geo",
               "district" in phone_rows["PB001"], False)
+
+        # --- phone-keyed pulls (turn_export_anon.py --phone-key) ----------
+        out_pk = data / "matrix_phonekey.csv"
+        cmd = [sys.executable, str(MERGER), "--out", str(out_pk), "--approved",
+               "--with-phone"]   # redundant here; must be ignored, not fatal
+        for week in WEEKS:
+            cmd += ["--week", "%s=%s" % (week, data / ("pullphone_%s.csv" % week))]
+        env_noroster = dict(env)
+        env_noroster.pop("TURN_DISSEM_PATH", None)   # no roster at all
+        proc = run(cmd, env_noroster, "phone-keyed run (no roster)")
+        check("phone-keyed exit code", proc.returncode, 0)
+        check("phone-keyed notes redundant flag",
+              "already phone-keyed" in (proc.stdout or ""), True)
+        with out_pk.open(encoding="utf-8-sig", newline="") as fh:
+            pk_reader = csv.DictReader(fh)
+            pk_header = pk_reader.fieldnames
+            pk_rows = {r["phone"]: r for r in pk_reader}
+        check("phone-keyed first column", pk_header[0], "phone")
+        check("phone-keyed has no ppbno column", "ppbno" in pk_header, False)
+        check("phone-keyed row count", len(pk_rows), 3)
+        check("phone-keyed PB001 w1 status",
+              pk_rows["919000000000"]["w1_status"], "read")
+        check("phone-keyed missing week",
+              pk_rows["919000000002"]["w3_status"], "not_in_pull")
+        proc = run(cmd + ["--geo"], env_noroster, "phone-keyed + --geo (must refuse)")
+        check("phone-keyed refuses --geo", proc.returncode != 0, True)
 
         # --- roster universe ---------------------------------------------
         out_all = data / "matrix_all.csv"

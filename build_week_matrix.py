@@ -13,8 +13,13 @@ writes: the weekly pulls are ppbno-keyed and nothing here needs a number.
 With --geo it adds district/mandal/cluster from the dissemination roster, the
 same way build_status_geo_file.py does.
 
---with-phone is the one deliberate exception. It joins MobileNo back in from
-the roster and writes it as a `phone` column. That is for an operator who
+If the pulls were made with `turn_export_anon.py --phone-key` (no roster, key
+column is the recipient number), this script accepts them unchanged and the
+first output column is `phone` instead of `ppbno`. --geo and --all-roster are
+unavailable in that case since they join through the roster.
+
+--with-phone is the other deliberate exception. It joins MobileNo back in from
+the roster and writes it as a `phone` column beside ppbno. That is for an operator who
 holds the roster anyway and needs the number next to the status. The file it
 produces contains PII: keep it out of the repo, out of shared drives, and
 delete it when the job is done.
@@ -104,23 +109,27 @@ def parse_week_arg(spec: str):
     return name, Path(path)
 
 
-def load_week(conn, name: str, path: Path) -> int:
-    """Returns the number of rows read from the weekly pull."""
+def load_week(conn, name: str, path: Path):
+    """Returns (rows read, key column name) for one weekly pull."""
     if not path.exists():
         raise SystemExit("Not found: %s" % path)
     rows = 0
     batch = []
     with path.open(encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
-        for needed in ("ppbno", "last_status"):
-            if needed not in (reader.fieldnames or []):
-                raise SystemExit(
-                    "%s has no %r column. Columns: %s"
-                    % (path.name, needed, reader.fieldnames))
-        has_ts = "last_status_timestamp" in reader.fieldnames
-        has_label = "arm_label" in reader.fieldnames
+        fields = reader.fieldnames or []
+        # Pulls are keyed on ppbno by default, or on the recipient number when
+        # turn_export_anon.py ran with --phone-key. Either works here.
+        key_col = ("ppbno" if "ppbno" in fields
+                   else "phone" if "phone" in fields else None)
+        if key_col is None or "last_status" not in fields:
+            raise SystemExit(
+                "%s needs a ppbno or phone column plus last_status. Columns: %s"
+                % (path.name, fields))
+        has_ts = "last_status_timestamp" in fields
+        has_label = "arm_label" in fields
         for row in reader:
-            ppbno = (row.get("ppbno") or "").strip()
+            ppbno = (row.get(key_col) or "").strip()
             if not ppbno:
                 continue
             rows += 1
@@ -139,7 +148,7 @@ def load_week(conn, name: str, path: Path) -> int:
     if batch:
         upsert(conn, batch)
     conn.commit()
-    return rows
+    return rows, key_col
 
 
 def upsert(conn, batch) -> None:
@@ -205,8 +214,9 @@ def build_universe(conn, use_roster: bool) -> int:
     return conn.execute("SELECT COUNT(*) FROM farmers").fetchone()[0]
 
 
-def build_query(weeks, with_geo: bool, with_phone: bool = False) -> str:
-    selects = ["f.ppbno"]
+def build_query(weeks, with_geo: bool, with_phone: bool = False,
+                key_name: str = "ppbno") -> str:
+    selects = ["f.ppbno AS %s" % key_name]
     joins = []
     if with_geo or with_phone:
         joins.append("LEFT JOIN geo g ON g.ppbno = f.ppbno")
@@ -234,8 +244,8 @@ def build_query(weeks, with_geo: bool, with_phone: bool = False) -> str:
 
 
 def write_csv(conn, weeks, out_path: Path, with_geo: bool, limit: int,
-              with_phone: bool = False) -> int:
-    query = build_query(weeks, with_geo, with_phone)
+              with_phone: bool = False, key_name: str = "ppbno") -> int:
+    query = build_query(weeks, with_geo, with_phone, key_name)
     if limit:
         query += "\n LIMIT %d" % limit
     cur = conn.execute(query)
@@ -314,8 +324,10 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--week", action="append", required=True, metavar="NAME=CSV",
                    help="One weekly anon pull (repeatable, order preserved).")
-    p.add_argument("--out", type=Path,
-                   default=config.DATA_DIR / "farmer_week_matrix.csv")
+    p.add_argument("--out", type=Path, default=None,
+                   help="Output CSV. Default data/farmer_week_matrix.csv, or "
+                        "data/farmer_week_matrix_with_phone.csv when the file "
+                        "will contain phone numbers.")
     p.add_argument("--geo", action="store_true",
                    help="Add district/mandal/cluster from the roster.")
     p.add_argument("--all-roster", action="store_true",
@@ -353,22 +365,45 @@ def main():
     conn.executescript(SCHEMA)
 
     try:
+        key_cols = set()
         for name, path in pairs:
-            rows = load_week(conn, name, path)
+            rows, key_col = load_week(conn, name, path)
+            key_cols.add(key_col)
             kept = conn.execute("SELECT COUNT(*) FROM weekly WHERE week = ?",
                                 (name,)).fetchone()[0]
             note = ("" if kept == rows
-                    else "  (%s duplicate ppbno rows collapsed to the furthest "
-                         "status)" % format(rows - kept, ","))
+                    else "  (%s duplicate %s rows collapsed to the furthest "
+                         "status)" % (format(rows - kept, ","), key_col))
             print("%-6s %s rows from %s%s"
                   % (name, format(rows, ","), path.name, note))
+
+        if len(key_cols) != 1:
+            raise SystemExit("Weekly pulls are keyed differently (%s). Pull "
+                             "every week the same way." % sorted(key_cols))
+        key_name = key_cols.pop()
+        if key_name == "phone":
+            if args.geo or args.all_roster:
+                raise SystemExit("--geo and --all-roster join through the "
+                                 "roster on ppbno, but these pulls are "
+                                 "phone-keyed (--phone-key). Drop those flags.")
+            if args.with_phone:
+                print("note: pulls are already phone-keyed, --with-phone is "
+                      "redundant and ignored.")
+                args.with_phone = False
+
+        # Name the file after what it contains, so a phone-bearing CSV is
+        # never mistaken for an anonymised one.
+        has_phone = key_name == "phone" or args.with_phone
+        if args.out is None:
+            args.out = config.DATA_DIR / ("farmer_week_matrix_with_phone.csv"
+                                          if has_phone else "farmer_week_matrix.csv")
 
         if args.geo or args.with_phone:
             print("roster: %s ppbno rows"
                   % format(load_roster(conn, args.with_phone), ","))
-        if args.with_phone:
-            print("NOTE: --with-phone set. %s will contain phone numbers."
-                  % args.out.name)
+        if has_phone:
+            print("NOTE: %s will contain phone numbers. Keep it out of the "
+                  "repo and shared drives." % args.out.name)
 
         total = build_universe(conn, args.all_roster)
         print("universe: %s farmers" % format(total, ","))
@@ -376,7 +411,7 @@ def main():
         if args.preview and not args.approved and not args.limit_rows:
             preview_path = args.out.with_suffix(".preview.csv")
             written = write_csv(conn, weeks, preview_path, args.geo,
-                                args.preview, args.with_phone)
+                                args.preview, args.with_phone, key_name)
             print("\nwrote %s preview rows to %s"
                   % (format(written, ","), preview_path))
             print_preview(preview_path, written)
@@ -396,7 +431,7 @@ def main():
                 return
 
         written = write_csv(conn, weeks, args.out, args.geo, args.limit_rows,
-                            args.with_phone)
+                            args.with_phone, key_name)
         print("\nwrote %s rows to %s" % (format(written, ","), args.out))
         summarise(conn, weeks)
     finally:

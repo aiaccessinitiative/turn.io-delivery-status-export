@@ -10,6 +10,8 @@ Modes:
                      VARIANT_RE, e.g. var1..varN / 0528_varN / uncertain_vid)
   --campaign-regex   pull a different campaign by name (e.g. '^promo arm \\d')
   --inbound          pull farmer-sent inbound TEXT replies
+  --phone-key        write the recipient phone number as the key column
+                     instead of ppbno; no roster needed. Output is PII.
 
 Resumable: the time range is split into sub-windows, each written to its own
 file with a .done marker; re-running the SAME command skips completed windows
@@ -29,6 +31,7 @@ import csv
 import datetime as dt
 import json
 from http.client import HTTPException
+import os
 import re
 import shutil
 import sys
@@ -55,9 +58,34 @@ ARM_MAP     = {str(i): ("1" if i <= 5 else "2" if i <= 11 else "3") for i in ran
 
 
 class RateLimiter:
-    def __init__(self, limit=55, window=60.0):
-        self.limit = limit; self.window = window
+    """Sliding-window limiter. Starts at `limit` requests per `window` seconds.
+    Unless `adaptive` is False, it re-paces itself to ~92% of whatever Turn
+    reports in the x-ratelimit-limit header, so a raised quota (e.g. 60 -> 120
+    per minute) is used automatically and a lowered one is respected. The
+    detected value is printed once each time it changes."""
+    def __init__(self, limit=55, window=60.0, adaptive=True):
+        self.limit = limit; self.window = window; self.adaptive = adaptive
+        self.reported = None
         self.times: deque = deque(); self.lock = threading.Lock()
+
+    def observe(self, header_limit):
+        """Feed the x-ratelimit-limit header from any response (200 or 429)."""
+        if not self.adaptive or header_limit is None:
+            return
+        try:
+            lim = int(float(str(header_limit).strip()))
+        except (TypeError, ValueError):
+            return
+        if lim <= 0:
+            return
+        target = max(1, int(lim * 0.92))
+        with self.lock:
+            if lim == self.reported:
+                return
+            self.reported = lim
+            self.limit = target
+        print(f"  [rate] Turn reports {lim} requests/min for this number; "
+              f"pacing at {target}/min", flush=True)
 
     def acquire(self):
         while True:
@@ -82,9 +110,11 @@ def http(url: str, tok: str, limiter: RateLimiter, body: dict | None = None) -> 
             req = urllib.request.Request(url, data=data, headers=hdrs,
                                          method="POST" if data else "GET")
             with urllib.request.urlopen(req, timeout=120) as resp:
+                limiter.observe(resp.headers.get("x-ratelimit-limit"))
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:200]
+            limiter.observe(e.headers.get("x-ratelimit-limit"))
             if e.code == 429:
                 rst = e.headers.get("x-ratelimit-reset")
                 try:
@@ -173,7 +203,7 @@ def detect_band(frm: str, until: str, tok: str, limiter: RateLimiter) -> tuple[f
 
 
 def pull_window(idx: int, frm: str, until: str, tok: str, limiter: RateLimiter,
-                phone_map: dict, resume_dir: Path, cols: list, progress: dict) -> int:
+                phone_map: dict | None, resume_dir: Path, cols: list, progress: dict) -> int:
     """Pull one sub-window into its own file + .done marker. If the .done marker
     already exists (prior run finished this window), skip instantly. This makes
     the whole pull resumable: a killed run is restarted and only the unfinished
@@ -199,18 +229,20 @@ def pull_window(idx: int, frm: str, until: str, tok: str, limiter: RateLimiter,
                         # farmer-sent text replies only
                         if v1.get("direction") != "inbound" or m.get("type") != "text":
                             continue
-                        ph = m.get("from", "")[-10:]   # farmer phone, key only
-                        ppbno = phone_map.get(ph)
-                        if not ppbno:
-                            unm += 1
-                            continue
+                        if phone_map is None:        # --phone-key: no roster
+                            ppbno = m.get("from", "")
+                        else:                        # farmer phone, key only
+                            ppbno = phone_map.get(m.get("from", "")[-10:])
+                            if not ppbno:
+                                unm += 1
+                                continue
                         ts = m.get("timestamp", "")
                         try:
                             ts = dt.datetime.utcfromtimestamp(int(ts)).isoformat() + "Z"
                         except (ValueError, TypeError):
                             pass
                         batch.append({
-                            "ppbno": ppbno,
+                            cols[0]: ppbno,
                             "reply_timestamp": ts,
                             "reply_text": (m.get("text") or {}).get("body", "") or "",
                             "in_reply_to": v1.get("in_reply_to") or "",
@@ -221,11 +253,13 @@ def pull_window(idx: int, frm: str, until: str, tok: str, limiter: RateLimiter,
                     camp = ((v1.get("author") or {}).get("name", "") or "").strip()
                     if not VARIANT_RE.match(camp):
                         continue
-                    ph = m.get("to", "")[-10:]   # lookup key only, never written
-                    ppbno = phone_map.get(ph)
-                    if not ppbno:
-                        unm += 1
-                        continue
+                    if phone_map is None:            # --phone-key: no roster
+                        ppbno = m.get("to", "")
+                    else:                            # lookup key only, never written
+                        ppbno = phone_map.get(m.get("to", "")[-10:])
+                        if not ppbno:
+                            unm += 1
+                            continue
                     vn_m = re.search(r"\d+", camp)
                     vn = vn_m.group() if vn_m else "?"
                     arm = ARM_MAP.get(vn, "?")
@@ -238,7 +272,7 @@ def pull_window(idx: int, frm: str, until: str, tok: str, limiter: RateLimiter,
                     # wamid base64-encodes the recipient phone number, which
                     # would defeat the phone-never-on-disk rule.
                     batch.append({
-                        "ppbno": ppbno, "variant": camp, "arm": arm,
+                        cols[0]: ppbno, "variant": camp, "arm": arm,
                         "arm_label": ARM_LABEL.get(arm, ""),
                         "last_status": v1.get("last_status") or "no_status",
                         "timestamp": ts,  # send time
@@ -280,11 +314,21 @@ def main():
                     help="pull farmer-sent INBOUND text replies (ppbno, "
                          "reply_timestamp, reply_text, in_reply_to) instead of "
                          "outbound sends. Ignores --auto-band/--campaign-regex.")
+    ap.add_argument("--rate-limit", type=int, default=0,
+                    help="requests per minute to pace at. Default 0 = start at "
+                         "55/min and adapt to the x-ratelimit-limit header Turn "
+                         "returns (prints the detected value).")
+    ap.add_argument("--phone-key", action="store_true",
+                    help="write the recipient phone number as the key column "
+                         "(named 'phone') instead of ppbno, and skip the "
+                         "dissemination roster entirely. The output then "
+                         "contains phone numbers: keep it out of the repo and "
+                         "shared drives.")
     ap.add_argument("--out-dir", default=str(config.DATA_DIR))
     args = ap.parse_args()
 
     tok = config.require_token()
-    dissem_path = config.require_dissem()
+    dissem_path = None if args.phone_key else config.require_dissem()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -299,25 +343,34 @@ def main():
         VARIANT_RE = re.compile(args.campaign_regex, re.IGNORECASE)
         print(f"campaign filter overridden -> {args.campaign_regex!r}", flush=True)
 
-    # Phase 1: load phone->ppbno mapping in memory
-    print("Loading phone->ppbno mapping...", flush=True)
-    phone_map: dict[str, str] = {}
-    with open(dissem_path, encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            ph = row["MobileNo"].strip()[-10:]
-            phone_map[ph] = row["ppbno"].strip()
-    print(f"  {len(phone_map):,} mappings loaded", flush=True)
+    # Phase 1: load phone->ppbno mapping in memory (skipped with --phone-key,
+    # where the recipient number itself is the key and no roster is read)
+    phone_map: dict[str, str] | None
+    if args.phone_key:
+        phone_map = None
+        print("PHONE-KEY mode: key column is the recipient phone number; "
+              "no roster used. Output contains PII.", flush=True)
+    else:
+        print("Loading phone->ppbno mapping...", flush=True)
+        phone_map = {}
+        with open(dissem_path, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                ph = row["MobileNo"].strip()[-10:]
+                phone_map[ph] = row["ppbno"].strip()
+        print(f"  {len(phone_map):,} mappings loaded", flush=True)
 
     # Phase 2: RESUMABLE pull. Split the band into sub-windows; each window is
     # pulled into its own file + .done marker. A killed run is simply re-run
     # with the same command: completed windows skip instantly, only unfinished
     # ones re-pull. Band/windows are computed once and saved so they're
     # identical across restarts (auto-band's binary search varies by seconds).
-    limiter = RateLimiter(55)
+    limiter = (RateLimiter(args.rate_limit, adaptive=False) if args.rate_limit > 0
+               else RateLimiter(55, adaptive=True))
     n = args.workers
-    cols = (["ppbno", "reply_timestamp", "reply_text", "in_reply_to"] if INBOUND
-            else ["ppbno", "variant", "arm", "arm_label", "last_status", "timestamp", "last_status_timestamp"])
-    resume_dir = out_dir / f"_resume_{args.frm[:10]}"
+    key_col = "phone" if args.phone_key else "ppbno"
+    cols = ([key_col, "reply_timestamp", "reply_text", "in_reply_to"] if INBOUND
+            else [key_col, "variant", "arm", "arm_label", "last_status", "timestamp", "last_status_timestamp"])
+    resume_dir = out_dir / f"_resume_{args.frm[:10]}{'_phone' if args.phone_key else ''}"
     resume_dir.mkdir(parents=True, exist_ok=True)
     wjson = resume_dir / "windows.json"
 
@@ -342,7 +395,8 @@ def main():
         wjson.write_text(json.dumps({"t0": t0lbl, "t1": t1lbl, "windows": windows}))
 
     print(f"Pulling messages: {t0lbl} -> {t1lbl}", flush=True)
-    print(f"  {n} workers draining {len(windows)} sub-windows, rate<=55/min", flush=True)
+    print(f"  {n} workers draining {len(windows)} sub-windows, "
+          f"rate<={limiter.limit}/min{' (adaptive)' if limiter.adaptive else ''}", flush=True)
 
     progress: dict = {}
     stop_mon = threading.Event()
@@ -375,7 +429,8 @@ def main():
         sys.exit(2)
 
     stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M")
-    out_path = out_dir / f"farmers_delivery_status_anon_{stamp}.csv"
+    label = "with_phone" if args.phone_key else "anon"
+    out_path = out_dir / f"farmers_delivery_status_{label}_{stamp}.csv"
     counts: dict = {}; status_counts: dict = {}; total = 0; unmatched = 0
     with open(out_path, "w", newline="", encoding="utf-8-sig") as fout:
         writer = csv.DictWriter(fout, fieldnames=cols)
