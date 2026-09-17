@@ -73,7 +73,7 @@ Key flags:
 - `--auto-band` — probe for the actual send band and slice only that, avoiding empty-region waste. Do not use for `--inbound` (replies are scattered, not banded).
 - `--chunks N` — split the window into N sub-windows (default `workers*8`). More chunks = finer resume granularity.
 - `--slice-minutes M` — with `--auto-band`, width of each sub-window (default 15).
-- `--campaign-regex RE` — override the campaign-name filter (default matches `var1..varN` / `0528_varN` / `uncertain_vid`).
+- `--campaign-regex RE` — override the campaign-name filter (default matches `var1..varN` / `MMDD_varN` such as `0528_var7` / `uncertain_vid`).
 - `--inbound` — pull farmer-sent text replies instead of sends.
 - `--phone-key` — no roster needed; the key column is `phone` (recipient number) instead of `ppbno`, and the output is named `farmers_delivery_status_with_phone_<stamp>.csv`. `turn_export_with_phone.py` is the same thing with the flag forced on. The `build_*`/`wow_*` report scripts expect ppbno-keyed `_anon_` files and ignore these; only `build_week_matrix.py` accepts them. See the privacy model above.
 - `--rate-limit N` — pin the pace at N requests/min instead of adapting to Turn's header.

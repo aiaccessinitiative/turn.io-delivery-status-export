@@ -42,6 +42,8 @@ PAGES = {
         {"messages": [msg("919000000004", "var7", "delivered",
                           direction="inbound", mtype="text")]},  # inbound, skip
         msg("919000000005", "0528_var9", "sent"),      # in roster, week-1 prefix
+        msg("919000000006", "0611_var3", "delivered"), # other date prefix, keep
+        msg("919000000007", "var12_test", "read"),     # not a campaign name, drop
     ], "paging": {}},
 }
 
@@ -93,10 +95,14 @@ def main():
         check("roster mode status", rows[0]["last_status"], "read")
 
         n, rows, unm = run_window(None, COLS_PHONE, root)
-        check("phone-key rows written", n, 3)
+        check("phone-key rows written", n, 4)
         check("phone-key unmatched is zero", unm, 0)
         check("phone-key keys", sorted(r["phone"] for r in rows),
-              ["919000000001", "919000000002", "919000000005"])
+              ["919000000001", "919000000002", "919000000005", "919000000006"])
+        check("any MMDD_ date prefix on varN is kept",
+              any(r["variant"] == "0611_var3" for r in rows), True)
+        check("varN with a suffix is not a campaign",
+              any(r["variant"] == "var12_test" for r in rows), False)
         check("phone-key keeps the unmatched farmer's status",
               next(r for r in rows if r["phone"] == "919000000002")["last_status"],
               "failed")

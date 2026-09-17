@@ -48,7 +48,10 @@ import config
 BASE    = config.BASE
 ACCEPT  = config.ACCEPT
 ARM_LABEL   = {"1": "WA Text", "2": "WA Text+Image", "3": "WA Bundle"}
-VARIANT_RE  = re.compile(r"^((0528_)?var\d+|uncertain_vid)$", re.IGNORECASE)
+# Reminder names as Turn reports them in _vnd.v1.author.name: "var4",
+# "0528_var7" (week 1 carried a MMDD_ prefix), "uncertain_vid". Any MMDD_
+# prefix is accepted so a later week that reuses the prefix is not dropped.
+VARIANT_RE  = re.compile(r"^((\d{4}_)?var\d+|uncertain_vid)$", re.IGNORECASE)
 INBOUND     = False  # when True, pull farmer-sent inbound TEXT replies instead of sends
 # Rough DEFAULT arm split, used only to populate the (non-authoritative) arm
 # column in the raw pull. The real split CHANGES EVERY WEEK and is re-derived
