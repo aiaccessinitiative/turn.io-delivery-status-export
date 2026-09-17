@@ -87,7 +87,8 @@ def main():
 
         n, rows, unm = run_window(ROSTER, COLS_PPBNO, root)
         check("roster mode rows written", n, 2)
-        check("roster mode unmatched counted", unm, 1)
+        # ...0002 (var4) and ...0006 (0611_var3) are var sends not in the roster
+        check("roster mode unmatched counted", unm, 2)
         check("roster mode keys", sorted(r["ppbno"] for r in rows), ["PB001", "PB005"])
         check("roster mode never writes a phone",
               any("9190000" in v for r in rows for v in r.values()), False)
